@@ -1,0 +1,245 @@
+// README (keep this at the top for easy setup)
+// 1) Create a new GitHub repo and paste these files in.
+// 2) In Vercel: “Import Project” from your repo.
+// 3) Set env vars in Vercel:
+//    NEXT_PUBLIC_SUPABASE_URL=... (Supabase → Project Settings → URL)
+//    NEXT_PUBLIC_SUPABASE_ANON_KEY=... (Supabase → Project Settings → anon key)
+//    SUPABASE_SERVICE_ROLE_KEY=... (server only)
+//    PIN_PEPPER=make_up_a_long_random_string
+// 4) Deploy. Visit your site; try a PIN punch.
+//
+// Notes:
+// - This app lets employees clock in/out with just a PIN (fast).
+// - Admins will come later (separate dashboard route).
+// - Geofence: enabled (requires GPS permission). If outside radius or no location → rejected.
+// - Allowed actions: CLOCK_IN, CLOCK_OUT, LUNCH_OUT, LUNCH_IN via two simple buttons.
+
+// package.json
+export const pkg = {
+  name: "employee-pin-clock",
+  version: "0.1.0",
+  private: true,
+  scripts: {
+    dev: "next dev",
+    build: "next build",
+    start: "next start",
+    lint: "next lint"
+  },
+  dependencies: {
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "@supabase/supabase-js": "2.45.4",
+    "bcryptjs": "2.4.3"
+  }
+};
+
+// next.config.mjs
+export default {
+  reactStrictMode: true,
+};
+
+// app/layout.tsx
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body style={{ fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial' }}>
+        {children}
+      </body>
+    </html>
+  );
+}
+
+// lib/geo.ts
+export function metersBetween(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371000;
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// lib/supabase-server.ts
+import { createClient } from '@supabase/supabase-js';
+export function adminClient() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+}
+
+// app/page.tsx (Employee Punch UI)
+'use client';
+import { useEffect, useState } from 'react';
+
+type State = 'idle' | 'ready' | 'working' | 'lunch' | 'error' | 'success';
+
+export default function Home() {
+  const [pin, setPin] = useState('');
+  const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [status, setStatus] = useState<State>('idle');
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => {
+    navigator.geolocation.getCurrentPosition(
+      (p) => setCoords({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      () => setMsg('Location is required for punching. Please allow location.'),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }, []);
+
+  async function punch(flow: 'WORK' | 'LUNCH') {
+    if (!pin || pin.length < 4) { setMsg('Enter your PIN'); return; }
+    if (!coords) { setMsg('No location yet. Try again.'); return; }
+
+    const intended = flow === 'WORK' ? 'WORK' : 'LUNCH';
+    const confirmText = intended === 'WORK' ? 'Proceed with Work punch (Clock In/Out)?' : 'Proceed with Lunch punch (Out/In)?';
+    if (!window.confirm(confirmText)) return;
+
+    setStatus('working'); setMsg('');
+    const res = await fetch('/api/punch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, lat: coords.lat, lng: coords.lng, flow: intended })
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus('error'); setMsg(data.reason || data.error || 'Error'); return; }
+    setStatus('success'); setMsg(data.message || 'Recorded');
+  }
+
+  return (
+    <main style={{ maxWidth: 420, margin: '40px auto', padding: 16 }}>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Company Time Clock</h1>
+      <p style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Enter your PIN. Your GPS location is used only at punch time to verify you are at an approved site.</p>
+      <input
+        inputMode="numeric"
+        pattern="[0-9]*"
+        placeholder="PIN"
+        value={pin}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+        style={{ width: '100%', padding: 10, fontSize: 16, border: '1px solid #ccc', borderRadius: 8, marginBottom: 12 }}
+      />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <button onClick={() => punch('WORK')} style={{ padding: 14, borderRadius: 10, border: '1px solid #111' }}>Work</button>
+        <button onClick={() => punch('LUNCH')} style={{ padding: 14, borderRadius: 10, border: '1px solid #111' }}>Lunch</button>
+      </div>
+      <div style={{ minHeight: 28, marginTop: 12, fontSize: 14 }}>{msg}</div>
+    </main>
+  );
+}
+
+// app/api/punch/route.ts (Server: verifies PIN, geofence, writes punch)
+import { NextRequest, NextResponse } from 'next/server';
+import { adminClient } from '@/lib/supabase-server';
+import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
+import { metersBetween } from '@/lib/geo';
+
+type Flow = 'WORK' | 'LUNCH';
+
+type PunchAction = 'CLOCK_IN' | 'CLOCK_OUT' | 'LUNCH_OUT' | 'LUNCH_IN';
+
+function fingerprint(pin: string) {
+  const pepper = process.env.PIN_PEPPER || '';
+  return crypto.createHash('sha256').update(pin + pepper).digest('hex');
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const { pin, lat, lng, flow } = await req.json();
+    if (!pin || typeof lat !== 'number' || typeof lng !== 'number' || !flow) {
+      return NextResponse.json({ error: 'Missing fields' }, { status: 400 });
+    }
+
+    const supa = adminClient();
+
+    // 1) Find employee by PIN fingerprint
+    const fp = fingerprint(pin);
+    const { data: emp, error: empErr } = await supa
+      .from('employees')
+      .select('id, pin_hash, site_id, is_active')
+      .eq('pin_fingerprint', fp)
+      .maybeSingle();
+
+    if (empErr || !emp || !emp.is_active) {
+      return NextResponse.json({ error: 'Invalid PIN or inactive employee' }, { status: 401 });
+    }
+
+    // 2) Verify bcrypt hash to be safe
+    const ok = emp.pin_hash ? await bcrypt.compare(pin, emp.pin_hash) : false;
+    if (!ok) return NextResponse.json({ error: 'Invalid PIN' }, { status: 401 });
+
+    // 3) Geofence check
+    let rejected = false; let reason = ''; let site_id = emp.site_id as string | null;
+    if (site_id) {
+      const { data: site } = await supa.from('sites').select('*').eq('id', site_id).maybeSingle();
+      if (site && typeof site.latitude === 'number' && typeof site.longitude === 'number' && typeof site.radius_m === 'number') {
+        const dist = metersBetween(lat, lng, site.latitude, site.longitude);
+        if (dist > site.radius_m) { rejected = true; reason = `Outside geofence (${Math.round(dist)}m)`; }
+      } else { rejected = true; reason = 'Site location not configured'; }
+    } else { rejected = true; reason = 'No site assigned'; }
+
+    // 4) Decide action based on flow + last action (prevents accidental flip)
+    let action: PunchAction = 'CLOCK_IN';
+    const { data: last } = await supa
+      .from('time_punches')
+      .select('action')
+      .eq('employee_id', emp.id)
+      .eq('rejected', false)
+      .order('punched_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const lastAction = last?.action as PunchAction | undefined;
+    if (flow === 'WORK') {
+      action = (lastAction === 'CLOCK_IN' || lastAction === 'LUNCH_IN') ? 'CLOCK_OUT' : 'CLOCK_IN';
+    } else {
+      action = (lastAction === 'LUNCH_OUT') ? 'LUNCH_IN' : 'LUNCH_OUT';
+    }
+
+    // 5) Rate limit: prevent duplicate within 2 minutes
+    const { data: recent } = await supa
+      .from('time_punches')
+      .select('punched_at')
+      .eq('employee_id', emp.id)
+      .order('punched_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (recent) {
+      const diff = (Date.now() - new Date(recent.punched_at as string).getTime()) / 60000;
+      if (diff < 2) {
+        return NextResponse.json({ error: 'Too soon since last punch' }, { status: 429 });
+      }
+    }
+
+    // 6) Insert punch (even rejections for audit)
+    const { error: insErr } = await supa.from('time_punches').insert({
+      employee_id: emp.id,
+      action,
+      latitude: lat,
+      longitude: lng,
+      site_id: site_id,
+      rejected,
+      rejection_reason: rejected ? reason : null
+    });
+
+    if (insErr) return NextResponse.json({ error: insErr.message }, { status: 500 });
+
+    if (rejected) return NextResponse.json({ ok: false, rejected: true, reason }, { status: 403 });
+
+    const message = action.replace('_', ' ') + ' recorded';
+    return NextResponse.json({ ok: true, message });
+  } catch (e: any) {
+    return NextResponse.json({ error: e.message }, { status: 500 });
+  }
+}
+
+// .env.example
+export const env_example = `NEXT_PUBLIC_SUPABASE_URL=YOUR_SUPABASE_URL
+NEXT_PUBLIC_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
+PIN_PEPPER=change_this_to_a_long_random_string
+`;
